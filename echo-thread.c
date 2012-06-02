@@ -37,51 +37,40 @@
 void PANIC(char* msg);
 #define PANIC(msg)  { perror(msg); exit(-1); }
 
-#define MAXLEN 100
+#define MAXLEN 1024
 
 struct options {
     long delay;
+
+    // "private" attributes
+    unsigned long id;
     int socket;
 };
 
-char* repr(char* str)
-{
-    int control_count = 0;
-    int i, j;
-    int len = strlen(str);
-    char* out;
-    char hex[3];
+pthread_mutex_t lock;
+int nconns = 0;
+unsigned long total = 0;
+int debug = 0;
 
-    for (i=0; i<len; ++i)
-    {
-        if (str[i] < 32)
-            control_count += 1;
-    }
+unsigned long nconns_inc() {
+    if (pthread_mutex_lock(&lock) != 0)
+        PANIC("pthread mutex lock");
 
-    out = malloc(sizeof(char) * len + (3 * control_count) + 1);
-    out[len + (3 * control_count)] = 0;
+    nconns += 1;
+    total += 1;
 
-    for (i=0, j=0; i<len; ++i)
-    {
-        if (str[i] < 32 || str[i] == 127) {
-            /* put in \xNN in place of the unprintable char */
-            out[j++] = '\\';
-            if (str[i] == 10) {
-                out[j++] = 'n';
-            } else if (str[i] == 13) {
-                out[j++] = 'r';
-            } else {
-                snprintf(hex, 3, "%02x", (char)str[i]);
-                out[j++] = 'x';
-                out[j++] = hex[0];
-                out[j++] = hex[1];
-            }
-        } else {
-            out[j++] = str[i];
-        }
-    }
+    pthread_mutex_unlock(&lock);
 
-    return out;
+    return total;
+}
+
+void nconns_dec() {
+    if (pthread_mutex_lock(&lock) != 0)
+        PANIC("pthread mutex lock");
+
+    nconns -= 1;
+
+    pthread_mutex_unlock(&lock);
 }
 
 /*--------------------------------------------------------------------*/
@@ -90,37 +79,62 @@ char* repr(char* str)
 void* Child(void* arg)
 {
     char line[MAXLEN];
-    char * linerepr;
-    int bytes_read;
+    int bytes;
     int socket;
+    uint32_t len = 0;
+    void * lenptr;
     long delay;
-    pthread_t _self = pthread_self();
-    unsigned long self = (unsigned long)&_self;
+    unsigned long self;
+    int millis = 0;
 
     struct options * opts = (struct options*)arg;
-    delay = opts->delay * 1000;
+    delay = opts->delay;
     socket = opts->socket;
+    self = opts->id;
     free(arg);
     arg = opts = NULL;
 
-    printf("%lx: hello\n", self);
-
-    do {
-        bzero(line, MAXLEN);
-        bytes_read = recv(socket, line, sizeof(line), 0);
-        if (delay >= 0) {
-            printf("%lx: sleeping %ld usec\n", self, delay);
-            usleep(delay);
+    while (1) {
+        // read the length prefix
+        bytes = recv(socket, &len, 4, MSG_WAITALL);
+        len = ntohl(len);
+        if (len >= MAXLEN) {
+            // need a better way to signal this condition,
+            // or ideally not to have it possible at all.
+            if (debug) {
+                printf("conn[%lu]: message length %d too long, killing connection\n", self, len);
+            }
+            break;
         }
-        send(socket, line, bytes_read, 0);
 
-        linerepr = repr(line);
-        printf("%lx: '%s'\n", self, linerepr);
-        free(linerepr);
+        // read the actual message
+        bytes = recv(socket, &line[bytes], len, MSG_WAITALL);
+        if (bytes <= 0) {
+            break;
+        }
+        line[bytes] = 0;
+
+        if (delay >= 0) {
+            if (debug) {
+                printf("conn[%lu]: sleeping %ld usec\n", self, delay);
+            }
+            usleep(delay * 1000);
+            millis = delay;
+        }
+
+        bytes = snprintf(line, MAXLEN, "{\"millis\":%d}", millis);
+        if (debug) {
+            printf("conn[%lu]: put '%s'\n", self, line);
+        }
+
+        len = htonl(bytes);
+        lenptr = &len;
+        send(socket, lenptr, 4, 0);
+        send(socket, line, bytes, 0);
     }
-    while (strncmp(line, "bye\r", 4) != 0);
 
-    printf("%lx: bye\n", self);
+    nconns_dec();
+    printf("conn[%lu]: disconnecting (%d active)\n", self, nconns);
     close(socket);
 
     return NULL;
@@ -135,6 +149,9 @@ int listenloop(int port, struct options opts)
     int sd;
     struct sockaddr_in addr;
 
+    if (pthread_mutex_init(&lock, NULL) != 0)
+        PANIC("pthread mutex init");
+
     if ((sd = socket(PF_INET, SOCK_STREAM, 0)) < 0)
         PANIC("Socket");
 
@@ -147,6 +164,8 @@ int listenloop(int port, struct options opts)
     if (listen(sd, 20) != 0)
         PANIC("Listen");
 
+    printf("listening on %s:%d ...\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
     while (1) {
         int socket;
         socklen_t addr_size;
@@ -154,12 +173,14 @@ int listenloop(int port, struct options opts)
         struct options * threadopts;
 
         socket = accept(sd, (struct sockaddr*)&addr, &addr_size);
-        printf("Connected: %s:%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
         /* the child thread is responsible for freeing this memory */
         threadopts = malloc(sizeof(threadopts));
         threadopts->delay = opts.delay;
         threadopts->socket = socket;
+        threadopts->id = nconns_inc();
+
+        printf("conn[%lu]: from %s:%d (%d active)\n", threadopts->id, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), nconns);
 
         if (pthread_create(&child, NULL, Child, threadopts) != 0)
             perror("Thread creation");
@@ -208,7 +229,7 @@ int main(int argc, char* argv[])
     opts.delay = -1;
     int port = 9999;
 
-    while ((c = getopt(argc, argv, "hs:p:")) != -1) {
+    while ((c = getopt(argc, argv, "hs:p:d")) != -1) {
         switch (c) {
         case 's':
             longtmp = strtol(optarg, &endptr, 10);
@@ -224,6 +245,10 @@ int main(int argc, char* argv[])
             if (longtmp < 1 || longtmp > 65535)
                 return usage(1, "invalid port (must be in range [1, 65535])");
             port = longtmp;
+            break;
+
+        case 'd':
+            debug = 1;
             break;
 
         case 'h':
